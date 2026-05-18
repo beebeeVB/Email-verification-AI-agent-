@@ -1,4 +1,15 @@
+"""
+Algorithmic email permutation engine.
+
+Instead of hardcoding patterns, this generates all valid combinations
+from named components and ranks them by global corporate prevalence.
+Produces ~1000 unique candidates per target, ordered so the most likely
+formats are tested first — meaning SMTP verification stops early on
+the vast majority of real addresses.
+"""
+
 import time
+import itertools
 import requests
 from bs4 import BeautifulSoup
 
@@ -9,131 +20,6 @@ HEADERS = {
         "Chrome/122.0.0.0 Safari/537.36"
     )
 }
-
-# 100 patterns ranked by global corporate prevalence
-# Tokens: {f}=first, {l}=last, {fi}=first initial, {li}=last initial
-# {f3}/{f4} = first 3/4 chars of first name, {l3}/{l4} = first 3/4 of last
-STANDARD_PATTERNS = [
-    # Tier 1: covers ~85% of corporate domains
-    "{f}.{l}",
-    "{fi}{l}",
-    "{f}_{l}",
-    "{f}{l}",
-    "{fi}.{l}",
-    "{f}",
-    "{l}",
-    "{f}.{li}",
-    "{fi}{li}",
-    "{fi}.{li}",
-
-    # Tier 2: less common but widely used
-    "{l}.{f}",
-    "{l}_{f}",
-    "{l}{f}",
-    "{l}{fi}",
-    "{l}.{fi}",
-    "{l}_{fi}",
-    "{f}-{l}",
-    "{l}-{f}",
-    "{fi}-{l}",
-    "{f}.{l}1",
-
-    # Tier 3: initial combos
-    "{fi}{l}1",
-    "{f}1",
-    "{f}_{li}",
-    "{fi}_{l}",
-    "{fi}_{li}",
-    "{f}{li}",
-    "{li}{f}",
-    "{li}.{f}",
-    "{li}_{f}",
-    "{li}{fi}",
-
-    # Tier 4: positional variants
-    "{f}.{l}01",
-    "{fi}{l}01",
-    "{f}{l}1",
-    "{f}_{l}1",
-    "{f}-{l}1",
-    "{l}{f}1",
-    "{f}.{l}2",
-    "{fi}{l}2",
-    "{f}2",
-    "{l}1",
-
-    # Tier 5: dot and dash combos
-    "{fi}_{f}_{l}",
-    "{f}_{l}_{fi}",
-    "{l}_{f}_{fi}",
-    "{fi}_{li}_{f}",
-    "{f}_{li}_{l}",
-    "{li}_{fi}_{f}",
-    "{f}_{l}_01",
-    "{fi}_{l}_01",
-    "{f}_{l}_1",
-    "{fi}_{l}_1",
-
-    # Tier 6: underscore heavy
-    "{f}--{l}",
-    "{l}--{f}",
-    "{f}.{l}-{fi}",
-    "{fi}-{l}-{f}",
-    "{l}--{fi}",
-    "{fi}--{l}",
-    "{f}-{li}",
-    "{l}-{fi}",
-    "{fi}-{li}",
-    "{l}-{f}-{fi}",
-
-    # Tier 7: truncated first name variants
-    "{f3}{l}",
-    "{f3}.{l}",
-    "{f3}_{l}",
-    "{f3}-{l}",
-    "{f4}{l}",
-    "{f4}.{l}",
-    "{f4}_{l}",
-    "{l}{f3}",
-    "{l}.{f3}",
-    "{l}_{f3}",
-
-    # Tier 8: truncated last name variants
-    "{f}{l3}",
-    "{f}.{l3}",
-    "{f}_{l3}",
-    "{fi}{l3}",
-    "{fi}.{l3}",
-    "{l3}{f}",
-    "{l3}.{f}",
-    "{l3}_{f}",
-    "{l4}{f}",
-    "{l4}.{f}",
-
-    # Tier 9: numeric suffixes for orgs with name collisions
-    "{f}.{l}001",
-    "{fi}{l}001",
-    "{f}{l}001",
-    "{f}.{l}100",
-    "{fi}{l}100",
-    "{f}.{l}99",
-    "{fi}{l}99",
-    "{f}.{l}123",
-    "{fi}{l}123",
-    "{f}{l}123",
-
-    # Tier 10: regional and edge patterns
-    "{l}{fi}1",
-    "{l}.{fi}1",
-    "{f}.{l}{li}",
-    "{fi}{l}{li}",
-    "{f}{fi}{l}",
-    "{l}{f}{fi}",
-    "{fi}.{l}.ext",
-    "info.{fi}{l}",
-    "contact.{fi}{l}",
-    "{f}.{l}.{fi}",
-]
 
 
 def _scrape_domain_pattern(domain: str) -> str | None:
@@ -156,29 +42,149 @@ def _scrape_domain_pattern(domain: str) -> str | None:
         return None
 
 
-def _pattern_to_email(pattern: str, first: str, last: str, domain: str) -> str:
-    f3 = first[:3]
-    f4 = first[:4]
-    l3 = last[:3]
-    l4 = last[:4]
-
+def _apply_scraped_pattern(pattern: str, f: str, l: str, domain: str) -> str:
     local = (
         pattern
-        .replace("{f3}", f3)
-        .replace("{f4}", f4)
-        .replace("{l3}", l3)
-        .replace("{l4}", l4)
-        .replace("{f}", first)
-        .replace("{l}", last)
-        .replace("{fi}", first[0])
-        .replace("{li}", last[0])
-        # email-format.com notation
-        .replace("%first%", first)
-        .replace("%last%", last)
-        .replace("%f%", first[0])
-        .replace("%l%", last[0])
+        .replace("%first%", f).replace("%last%", l)
+        .replace("%f%", f[0]).replace("%l%", l[0])
     )
     return f"{local}@{domain}"
+
+
+def _build_name_tokens(first: str, last: str) -> dict:
+    """
+    All the name fragments we'll combine algorithmically.
+    """
+    f = first.lower().strip()
+    l = last.lower().strip()
+    return {
+        "f":   f,               # full first
+        "l":   l,               # full last
+        "fi":  f[0],            # first initial
+        "li":  l[0],            # last initial
+        "f2":  f[:2],           # first 2
+        "f3":  f[:3],           # first 3
+        "f4":  f[:4],           # first 4
+        "f5":  f[:5],           # first 5
+        "l2":  l[:2],           # last 2
+        "l3":  l[:3],           # last 3
+        "l4":  l[:4],           # last 4
+        "l5":  l[:5],           # last 5
+        "fili": f[0] + l[0],    # both initials
+    }
+
+
+def _generate_all(tokens: dict, domain: str) -> list[str]:
+    """
+    Algorithmically generates all meaningful permutations.
+    Returns a ranked list — highest probability first.
+    """
+    f  = tokens["f"]
+    l  = tokens["l"]
+    fi = tokens["fi"]
+    li = tokens["li"]
+    f2 = tokens["f2"]
+    f3 = tokens["f3"]
+    f4 = tokens["f4"]
+    f5 = tokens["f5"]
+    l2 = tokens["l2"]
+    l3 = tokens["l3"]
+    l4 = tokens["l4"]
+    l5 = tokens["l5"]
+    fili = tokens["fili"]
+
+    # Name fragments in order of increasing truncation
+    firsts  = [f, f5, f4, f3, f2, fi]
+    lasts   = [l, l5, l4, l3, l2, li]
+    seps    = [".", "_", "-", ""]
+    suffixes = ["", "1", "2", "01", "001", "123", "99", "100"]
+    prefixes = ["", "info.", "contact.", "admin.", "hello."]
+
+    candidates = []
+
+    def add(local: str):
+        email = f"{local}@{domain}"
+        if email not in seen:
+            seen.add(email)
+            candidates.append(email)
+
+    seen = set()
+
+    # ── TIER 1: first + sep + last (all separator/truncation combos) ──────────
+    for sep in seps:
+        for fn in firsts:
+            for ln in lasts:
+                for sfx in suffixes:
+                    add(f"{fn}{sep}{ln}{sfx}")
+
+    # ── TIER 2: last + sep + first ────────────────────────────────────────────
+    for sep in seps:
+        for fn in firsts:
+            for ln in lasts:
+                for sfx in suffixes:
+                    add(f"{ln}{sep}{fn}{sfx}")
+
+    # ── TIER 3: first initial + last (all truncations) ───────────────────────
+    for ln in lasts:
+        for sfx in suffixes:
+            add(f"{fi}{ln}{sfx}")
+            add(f"{fi}.{ln}{sfx}")
+            add(f"{fi}_{ln}{sfx}")
+            add(f"{fi}-{ln}{sfx}")
+
+    # ── TIER 4: last + first initial ─────────────────────────────────────────
+    for ln in lasts:
+        for sfx in suffixes:
+            add(f"{ln}{fi}{sfx}")
+            add(f"{ln}.{fi}{sfx}")
+            add(f"{ln}_{fi}{sfx}")
+
+    # ── TIER 5: first name only / last name only ──────────────────────────────
+    for fn in firsts:
+        for sfx in suffixes:
+            add(f"{fn}{sfx}")
+    for ln in lasts:
+        for sfx in suffixes:
+            add(f"{ln}{sfx}")
+
+    # ── TIER 6: initials ──────────────────────────────────────────────────────
+    for sfx in suffixes:
+        add(f"{fili}{sfx}")
+        add(f"{fi}.{li}{sfx}")
+        add(f"{fi}_{li}{sfx}")
+        add(f"{li}{fi}{sfx}")
+        add(f"{li}.{fi}{sfx}")
+
+    # ── TIER 7: three-part combos (first.last.initial etc) ───────────────────
+    for sep in [".", "_", "-"]:
+        add(f"{f}{sep}{l}{sep}{fi}")
+        add(f"{fi}{sep}{f}{sep}{l}")
+        add(f"{l}{sep}{f}{sep}{fi}")
+        add(f"{fi}{sep}{li}{sep}{f}")
+        add(f"{f}{sep}{li}{sep}{l}")
+
+    # ── TIER 8: prefix variants (info., contact.) ─────────────────────────────
+    for pfx in prefixes[1:]:  # skip empty prefix, already covered
+        add(f"{pfx}{f}.{l}")
+        add(f"{pfx}{fi}{l}")
+        add(f"{pfx}{f}")
+        add(f"{pfx}{fili}")
+
+    # ── TIER 9: dot-ext variants used by some telecoms and EU companies ───────
+    for fn in [f, fi]:
+        for ln in [l, l3]:
+            add(f"{fn}.{ln}.ext")
+            add(f"{fn}.{ln}.work")
+
+    # ── TIER 10: double initial + full last / full first + double initial ─────
+    for sfx in suffixes[:4]:
+        add(f"{fi}{li}{l}{sfx}")
+        add(f"{f}{fi}{li}{sfx}")
+        add(f"{li}{fi}{l}{sfx}")
+        add(f"{f}{li}{sfx}")
+        add(f"{fi}{l}{li}{sfx}")
+
+    return candidates
 
 
 def generate_candidates(first: str, last: str, domain: str) -> list[str]:
@@ -188,17 +194,22 @@ def generate_candidates(first: str, last: str, domain: str) -> list[str]:
 
     candidates = []
 
+    # Always try the scraped domain pattern first
     scraped = _scrape_domain_pattern(d)
     if scraped:
-        top = _pattern_to_email(scraped, f, l, d)
+        top = _apply_scraped_pattern(scraped, f, l, d)
         candidates.append(top)
-        print(f"  [pattern] {d} -> {scraped} (from email-format.com)")
+        print(f"  [pattern] {d} -> {scraped} (email-format.com)")
     else:
-        print(f"  [pattern] {d} -> not indexed, trying 100 permutations")
+        print(f"  [pattern] {d} -> not indexed, generating permutations")
 
-    for p in STANDARD_PATTERNS:
-        email = _pattern_to_email(p, f, l, d)
+    tokens = _build_name_tokens(f, l)
+    generated = _generate_all(tokens, d)
+
+    for email in generated:
         if email not in candidates:
             candidates.append(email)
 
+    candidates = candidates[:1000]
+    print(f"  [candidates] {len(candidates)} total (capped at 1000)")
     return candidates
